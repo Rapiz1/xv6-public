@@ -6,10 +6,23 @@
 #include "x86.h"
 #include "proc.h"
 #include "spinlock.h"
+#include "pstat.h"
+#include "rand.h"
+
+uint prng_seed;
+
+void srand(uint seed) {
+  prng_seed = seed;
+}
+
+uint rand(void) {
+  return prng_seed = (prng_seed*_PRNG_FACTOR + _PRNG_DELTA)%_PRNG_MOD;
+}
 
 struct {
   struct spinlock lock;
   struct proc proc[NPROC];
+  struct pstat pstat;
 } ptable;
 
 static struct proc *initproc;
@@ -79,7 +92,7 @@ allocproc(void)
   acquire(&ptable.lock);
 
   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
-    if(p->state == UNUSED)
+    if(p->state == UNUSED) 
       goto found;
 
   release(&ptable.lock);
@@ -88,6 +101,12 @@ allocproc(void)
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
+
+  int slotNum = p - ptable.proc;
+  ptable.pstat.pid[slotNum] = p->pid;
+  ptable.pstat.inuse[slotNum] = 1;
+  ptable.pstat.tickets[slotNum] = 1;
+  ptable.pstat.ticks[slotNum] = 0;
 
   release(&ptable.lock);
 
@@ -290,6 +309,13 @@ wait(void)
         kfree(p->kstack);
         p->kstack = 0;
         freevm(p->pgdir);
+
+        int slot = p - ptable.proc;
+        ptable.pstat.inuse[slot] = 0;
+        ptable.pstat.pid[slot] = 0;
+        ptable.pstat.tickets[slot] = 0;
+        ptable.pstat.ticks[slot] = 0;
+
         p->pid = 0;
         p->parent = 0;
         p->name[0] = 0;
@@ -332,9 +358,25 @@ scheduler(void)
 
     // Loop over process table looking for process to run.
     acquire(&ptable.lock);
+    int tickets = 0;
     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
       if(p->state != RUNNABLE)
         continue;
+      tickets += ptable.pstat.tickets[p - ptable.proc];
+    }
+    if (tickets == 0) {
+      release(&ptable.lock);
+      continue;
+    }
+    int randnum = rand()%tickets;
+    int acc = 0;
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+      if(p->state != RUNNABLE)
+        continue;
+
+      acc += ptable.pstat.tickets[p - ptable.proc];
+      if (acc > randnum) ;
+      else continue;
 
       // Switch to chosen process.  It is the process's job
       // to release ptable.lock and then reacquire it
@@ -349,6 +391,7 @@ scheduler(void)
       // Process is done running for now.
       // It should have changed its p->state before coming back.
       c->proc = 0;
+      break;
     }
     release(&ptable.lock);
 
@@ -515,7 +558,6 @@ procdump(void)
   struct proc *p;
   char *state;
   uint pc[10];
-
   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
     if(p->state == UNUSED)
       continue;
@@ -523,7 +565,7 @@ procdump(void)
       state = states[p->state];
     else
       state = "???";
-    cprintf("%d %s %s", p->pid, state, p->name);
+    cprintf("%d %s %s %d\n", p->pid, state, p->name, ptable.pstat.tickets[p - ptable.proc]);
     if(p->state == SLEEPING){
       getcallerpcs((uint*)p->context->ebp+2, pc);
       for(i=0; i<10 && pc[i] != 0; i++)
@@ -531,4 +573,20 @@ procdump(void)
     }
     cprintf("\n");
   }
+}
+
+int settickets(int num) {
+  if (num < 0) return -1;
+  acquire(&ptable.lock);
+  struct proc* proc = myproc();
+  ptable.pstat.tickets[proc - ptable.proc] = num;
+  release(&ptable.lock);
+  return 0;
+}
+
+int getpinfo(struct pstat* pstat) {
+  acquire(&ptable.lock);
+  *pstat = ptable.pstat;
+  release(&ptable.lock);
+  return 0;
 }
